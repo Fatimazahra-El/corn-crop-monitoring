@@ -1,0 +1,322 @@
+// Upload USDA Cropland Data Layer 
+// Crop mask assumption:
+// 2023 CDL is used to represent crop type during the 2024 season.
+// This assumes no crop rotation occurred for the selected field.
+
+var cdl = ee.Image('USDA/NASS/CDL/2023')
+var corn = cdl.select('cropland').eq(1).clip(farm);
+
+//Zoom to a famous crop producing area at Nebraska
+
+Map.setCenter(-101.37, 40.52, 13)
+Map.addLayer(corn.selfMask(), {palette:['orange']}, 'corn field 2023', false)
+
+// scale and filter the sentinel 2 collection by date and geometry 
+
+function scales2(img){
+  var scaled = img.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+                  .multiply(0.0001)
+  return img.addBands(scaled, null, true )
+}
+
+var start = '2024-05-01'
+var end = '2024-10-01'
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+.filterDate(start, end)
+.filterBounds(farm)
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+.map(scales2);
+
+
+// Apply mask S2 clouds
+
+var s2_cloudsfree= (function(img){
+  var qa = img.select('QA60') //select mask S2 clouds
+  var clouds = 1 << 10
+  var cirrus = 1 << 11
+  var mask = qa.bitwiseAnd(clouds).eq(0)
+            .and(qa.bitwiseAnd(cirrus).eq(0))
+return img.updateMask(mask)
+.copyProperties(img, ['system:time_start', 'system:time_end', 'system:index']
+)
+  
+});
+
+var s2_maskclouds = s2.map(s2_cloudsfree) 
+
+// Calculate NDVI
+
+var ndvi = s2_maskclouds.map(function(img){
+  return img
+  .normalizedDifference(['B4','B8'])
+  .rename('ndvi')
+  .copyProperties(img, ['system:time_start'])
+})
+
+print(ndvi)
+
+// Mask NDVI to corn only
+var ndvi_corn = ndvi.map(function(img){
+  return img.updateMask(corn);
+});
+
+// Create chart 
+
+var ndvi_chart = ui.Chart.image.series 
+({imageCollection : ndvi_corn , region: farm, reducer: ee.Reducer.mean(), scale : 10})
+.setOptions({
+  title : 'NDVI Chart for corn field 2024', 
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'NDVI'},
+  lineWidth : 2, 
+  pointSize : 4
+})
+
+print(ndvi_chart)
+
+// calculate daily rainfall
+
+var rainfall = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+.filterDate(start, end)
+.filterBounds(farm);
+
+// Create rain chart 
+
+var rain_chart = ui.Chart.image.series({
+  imageCollection : rainfall, region: farm, reducer:ee.Reducer.mean(), scale: 5000})
+  .setOptions({
+    title : 'rain Chart for corn field 2024', 
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Rainfall (mm)'},
+  lineWidth : 1, 
+  pointSize : 2 });
+  
+print(rain_chart);
+
+// Calculate NDVI for 10 years 
+
+var startHistory = '2014-05-01';
+var endHistory= '2024-10-31';
+
+var s2_history = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+.filterDate(startHistory, endHistory)
+.filterBounds(farm)
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+.map(s2_cloudsfree)
+.map(scales2);
+
+var ndvi_history = s2_history.map(function(img){
+  var ndvi_img = img.normalizedDifference(['B8','B4']).rename('NDVI_history')
+  .updateMask(corn)
+  .copyProperties(img, ['system:time_start', 'system:time_end', 'system:index']);
+   return ndvi_img;
+});
+
+// Calculate Monthly LTA
+
+var months = [5, 6, 7, 8];
+
+
+function monthlyAnomaly(month)
+{
+  // NDVI_month_2024
+var ndvi_month_2024 = ndvi_corn
+.filter(ee.Filter.calendarRange(month, month,'month'))
+.mean();
+
+// NDVI_month_LTA
+
+var ndvi_month_LTA = ndvi_history
+.filter(ee.Filter.calendarRange(month, month, 'month'))
+.mean();
+
+// Calculate ndvi anomaly 
+
+var ndvi_anomaly =  ndvi_month_2024.subtract(ndvi_month_LTA);
+
+var stats = ndvi_anomaly.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: farm,
+  scale: 10,
+  maxPixels: 1e9
+});
+
+return ee.Dictionary({'month': month, 'ndvi_anomaly': stats.get('ndvi')});
+}
+var anomalies = months.map(function(m) {
+  return monthlyAnomaly(m);
+});
+
+print('Monthly NDVI anomalies (May–Aug):', anomalies);
+
+var chartData = ee.FeatureCollection(
+  anomalies.map(function(d) {
+    var dict = ee.Dictionary(d);
+    return ee.Feature(null, {'month': dict.get('month'), 'ndvi_anomaly': dict.get('ndvi_anomaly')});
+  })
+);
+
+var anomalyChart = ui.Chart.feature.byFeature(chartData, 'month', 'ndvi_anomaly')
+  .setOptions({
+    title: 'Monthly NDVI Anomalies (May–Aug 2024)',
+    hAxis: {title: 'Month'},
+    vAxis: {title: 'NDVI Anomaly'},
+    lineWidth: 2,
+    pointSize: 6,
+    colors: ['orange']
+  });
+
+print(anomalyChart);
+
+// Calculate Kc using eq : Kc = 1.25*NDVI + 0.2
+
+var months = ee.List([5, 6, 7, 8]); // Corn peak season
+
+var monthly_ndvi_images = ee.ImageCollection(
+  months.map(function(m) {
+    m = ee.Number(m);
+
+    var ndvi_month = ndvi_corn
+      .filter(ee.Filter.calendarRange(m, m, 'month'))
+      .mean()
+      .set('month', m)
+      .set('system:time_start', ee.Date.fromYMD(2024, m, 15));
+
+    return ndvi_month;
+  })
+);
+
+print('Monthly NDVI images:', monthly_ndvi_images);
+
+function ndviToKc(ndviImage) {
+  return ndviImage
+    .multiply(1.25)   
+    .add(0.2)
+    .rename('Kc')
+    .copyProperties(ndviImage, ['system:time_start', 'month']);
+}
+
+var kc_corn = monthly_ndvi_images.map(ndviToKc);
+
+print('Monthly Kc (corn):', kc_corn);
+
+var kc_table = kc_corn.map(function(img) {
+  var meanKc = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: farm,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  return ee.Feature(null, {
+    'month': img.get('month'),
+    'Kc_mean': meanKc.get('Kc')
+  });
+});
+
+print('Monthly Kc values:', kc_table);
+
+var kc_chart = ui.Chart.feature.byFeature(
+  kc_table, 'month', 'Kc_mean'
+).setOptions({
+  title: 'Monthly Crop Coefficient (Kc) – Corn 2024',
+  hAxis: {title: 'Month'},
+  vAxis: {title: 'Kc'},
+  lineWidth: 2,
+  pointSize: 5
+});
+
+print(kc_chart);
+
+
+Map.addLayer(
+  kc_corn.first().clip(farm),
+  {min: 0.3, max: 1.4, palette: ['yellow', 'green']},
+  'Kc (first month)'
+);
+
+var kc_final = kc_corn.map(function(img) {
+  return img
+    .updateMask(corn)
+    .clip(farm);
+});
+// Climat demand
+
+var gridmet = ee.ImageCollection('IDAHO_EPSCOR/GRIDMET')
+  .filterDate(start, end)
+  .filterBounds(farm)
+  .select('eto');
+
+var months = ee.List([5, 6, 7, 8]);
+
+var monthly_eto = ee.ImageCollection(
+  months.map(function(m) {
+    m = ee.Number(m);
+
+    var eto_month = gridmet
+      .filter(ee.Filter.calendarRange(m, m, 'month'))
+      .sum()
+      .set('month', m)
+      .set('system:time_start', ee.Date.fromYMD(2024, m, 15));
+
+    return eto_month;
+  })
+);
+
+print('Monthly ET0:', monthly_eto);
+
+var kc_final = kc_corn.map(function(img) {
+  return img
+    .updateMask(corn)
+    .clip(farm);
+});
+
+// Calculate ETc Corn
+
+var etc_corn = ee.ImageCollection(
+  months.map(function(m) {
+    m = ee.Number(m);
+
+    var kc_img = kc_final
+      .filter(ee.Filter.eq('month', m))
+      .first();
+
+    var eto_img = monthly_eto
+      .filter(ee.Filter.eq('month', m))
+      .first();
+
+    return kc_img
+      .multiply(eto_img)
+      .rename('ETc')
+      .set('month', m)
+      .set('system:time_start', kc_img.get('system:time_start'));
+  })
+);
+
+print('Monthly ETc (corn):', etc_corn);
+
+// Calculate monthly irrigation
+
+var etc_table = etc_corn.map(function(img) {
+  var etc_mean = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: farm,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  return ee.Feature(null, {
+    'month': img.get('month'),
+    'ETc_mm': etc_mean.get('ETc'),
+    'ETc_inches': ee.Number(etc_mean.get('ETc')).divide(25.4) // Convert to inches
+  });
+});
+
+print('Monthly irrigation demand:', etc_table);
+
+Map.addLayer(
+  etc_corn.first(),
+  {min: 50, max: 200, palette: ['yellow', 'orange', 'red']},
+  'ETc (mm)'
+);
